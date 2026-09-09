@@ -126,6 +126,56 @@ def build_sync_message(
 
 
 # ---------------------------------------------------------------------------
+# Convergent version state
+# ---------------------------------------------------------------------------
+
+# Last-known-good DB versions, refreshed from disk only when db.json changes.
+# No polling: the check runs when a sync message arrives.
+_DB_MTIME: float | None = None
+_DB_VERSIONS: tuple[int, int] = (0, 17)
+
+
+def current_db_versions() -> tuple[int, int]:
+    """Advertised (syncVersion, schemaVersion), re-read if db.json changed."""
+    global _DB_MTIME, _DB_VERSIONS
+    try:
+        mtime = DB_JSON.stat().st_mtime
+    except OSError:
+        return _DB_VERSIONS
+    if _DB_MTIME is None or mtime != _DB_MTIME:
+        try:
+            ver = json.loads(DB_JSON.read_text()).get("version") or {}
+            _DB_VERSIONS = (
+                int(ver.get("syncVersion") or 0),
+                int(ver.get("schemaVersion") or 17),
+            )
+        except (ValueError, json.JSONDecodeError):
+            pass  # keep last good; never blank the advertisement
+        _DB_MTIME = mtime
+    return _DB_VERSIONS
+
+
+def seed_db_versions(sync_version: int, schema: int) -> None:
+    """Seed the version cache from startup identity until db.json is (re)read."""
+    global _DB_MTIME, _DB_VERSIONS
+    _DB_VERSIONS = (int(sync_version), int(schema))
+    try:
+        _DB_MTIME = DB_JSON.stat().st_mtime
+    except OSError:
+        _DB_MTIME = None
+
+
+def _parse_versions(body: Any) -> tuple[int, int] | None:
+    """Inbound (syncVersion, schemaVersion), or None if absent/unparseable."""
+    if not isinstance(body, dict):
+        return None
+    try:
+        return (int(body["syncVersion"]), int(body["schemaVersion"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Minimal WebSocket (server side)
 # ---------------------------------------------------------------------------
 
@@ -270,6 +320,12 @@ class PresenceHandler(BaseHTTPRequestHandler):
 
         sock = self.connection
         peer = self.client_address[0]
+        # Per-connection convergence state. ThreadingHTTPServer builds one
+        # handler instance per connection, so instance attributes are
+        # connection-scoped with no locking. Fresh state per connection keeps
+        # normal reconnects working (hello + one ack round, then quiet).
+        self._last_replied_pair = None
+        self._last_acked_peer = None
         if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
             print(f"synergy-presence: ws open from {peer}", flush=True)
 
@@ -294,9 +350,10 @@ class PresenceHandler(BaseHTTPRequestHandler):
 
     def _ws_send_hello(self, sock: socket.socket) -> None:
         ident = self.identity
+        our_sync, our_schema = current_db_versions()
         db_body = {
-            "syncVersion": ident["sync_version"],
-            "schemaVersion": ident["schema"],
+            "syncVersion": our_sync,
+            "schemaVersion": our_schema,
         }
         addpeer_body = {
             "id": ident["computer_id"],
@@ -309,7 +366,7 @@ class PresenceHandler(BaseHTTPRequestHandler):
                 body=db_body,
                 computer_id=ident["computer_id"],
                 serial=ident["serial"],
-                db_version=ident["schema"],
+                db_version=our_schema,
             ),
         )
         ws_send_text(
@@ -319,7 +376,7 @@ class PresenceHandler(BaseHTTPRequestHandler):
                 body=addpeer_body,
                 computer_id=ident["computer_id"],
                 serial=ident["serial"],
-                db_version=ident["schema"],
+                db_version=our_schema,
             ),
         )
 
@@ -372,10 +429,19 @@ class PresenceHandler(BaseHTTPRequestHandler):
                 return
 
         if msg_type == "dbcheck":
-            # Reply with our version so peer can decide; we never push full DB.
+            # Convergent: answer each distinct version situation once per
+            # connection, then stay silent. Equal versions need no chatter.
+            # We never push full DB.
+            our_sync, our_schema = current_db_versions()
+            peer = _parse_versions(body)
+            if peer is not None:
+                pair = (peer[0], peer[1], our_sync, our_schema)
+                if pair == self._last_replied_pair:
+                    return
+                self._last_replied_pair = pair
             db_body = {
-                "syncVersion": ident["sync_version"],
-                "schemaVersion": ident["schema"],
+                "syncVersion": our_sync,
+                "schemaVersion": our_schema,
             }
             ws_send_text(
                 sock,
@@ -384,11 +450,17 @@ class PresenceHandler(BaseHTTPRequestHandler):
                     body=db_body,
                     computer_id=ident["computer_id"],
                     serial=ident["serial"],
-                    db_version=ident["schema"],
+                    db_version=our_schema,
                 ),
             )
         elif msg_type == "addpeer":
-            # Acknowledge with our identity
+            # Acknowledge each distinct peer announcement once per connection.
+            # Re-acking identical announcements cannot converge by itself.
+            if isinstance(body, dict):
+                key = json.dumps(body, separators=(",", ":"), sort_keys=True)
+                if key == self._last_acked_peer:
+                    return
+                self._last_acked_peer = key
             addpeer_body = {
                 "id": ident["computer_id"],
                 "ips": ident["ips"],
@@ -410,6 +482,7 @@ class PresenceHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     identity = load_identity()
+    seed_db_versions(identity["sync_version"], identity["schema"])
     port = int(os.environ.get("SYNERGY_PING_PORT", DEFAULT_PORT))
     host = os.environ.get("SYNERGY_PRESENCE_BIND", "0.0.0.0")
 
