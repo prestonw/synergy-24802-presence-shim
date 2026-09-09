@@ -80,4 +80,4 @@ expected structure with placeholder values.
 
 ## License
 
-MIT. See `LICENSE` (fill in the copyright holder before publishing).
+MIT. See `LICENSE`
