@@ -1,0 +1,10 @@
+{
+  "myId": "YOUR_COMPUTER_ID",
+  "serial": "YOUR_SYNERGY_SERIAL",
+  "ips": {
+    "YOUR_COMPUTER_ID": ["192.0.2.10"]
+  },
+  "local_computers": {
+    "YOUR_COMPUTER_ID": "192.0.2.10"
+  }
+}

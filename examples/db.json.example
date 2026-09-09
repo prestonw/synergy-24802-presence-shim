@@ -1,0 +1,17 @@
+{
+  "version": {
+    "syncVersion": 0,
+    "schemaVersion": 17
+  },
+  "data": {
+    "mainID": {
+      "id": "YOUR_COMPUTER_ID"
+    },
+    "computers": {
+      "example-host": {
+        "id": "YOUR_COMPUTER_ID",
+        "ips": ["192.0.2.10"]
+      }
+    }
+  }
+}

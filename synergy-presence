@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Synergy 3 mesh presence on port 24802 (HTTP /ping + WebSocket peer).
+
+Official synergy-service cannot stay up on Hyprland (core needs RemoteDesktop).
+Input sharing is handled by waynergy on :24800. Peers still probe presence on
+:24802 — both HTTP /ping and a raw WebSocket used for mesh sync.
+
+This shim:
+  * answers /ping with the real signed response (online in Max UI)
+  * accepts ws://host:24802/ upgrades (stops "Unexpected server response: 404")
+  * exchanges minimal signed addpeer/dbcheck messages so the peer stays happy
+
+It does not run synergy-core and does not claim the 24800 client slot.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import platform
+import socket
+import struct
+import sys
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+DEFAULT_PORT = 24802
+LOCAL_JSON = Path.home() / ".var/app/com.symless.synergy/config/Synergy/local.json"
+DB_JSON = Path.home() / ".var/app/com.symless.synergy/config/Synergy/db.json"
+VERSION = "3.6.3"
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+# ---------------------------------------------------------------------------
+# Identity / signing
+# ---------------------------------------------------------------------------
+
+def load_identity() -> dict[str, Any]:
+    if not LOCAL_JSON.is_file():
+        raise SystemExit(f"missing Synergy local.json: {LOCAL_JSON}")
+    local = json.loads(LOCAL_JSON.read_text())
+    computer_id = local.get("myId") or ""
+    serial = local.get("serial") or ""
+    if not computer_id or not serial:
+        raise SystemExit("local.json missing myId or serial")
+
+    schema = 17
+    sync_version = 0
+    if DB_JSON.is_file():
+        try:
+            db = json.loads(DB_JSON.read_text())
+            ver = db.get("version") or {}
+            schema = int(ver.get("schemaVersion") or schema)
+            sync_version = int(ver.get("syncVersion") or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    ips: list[str] = []
+    ip_map = local.get("ips") or {}
+    if isinstance(ip_map, dict) and computer_id in ip_map:
+        ips = list(ip_map[computer_id])
+    local_computers = local.get("local_computers") or {}
+    if computer_id in local_computers and local_computers[computer_id] not in ips:
+        ips.insert(0, local_computers[computer_id])
+    if not ips:
+        # Fall back to hostname resolution of common interfaces
+        try:
+            ips.append(socket.gethostbyname(socket.gethostname()))
+        except OSError:
+            pass
+
+    return {
+        "computer_id": computer_id,
+        "serial": serial,
+        "schema": schema,
+        "sync_version": sync_version,
+        "ips": ips,
+        "hostname": socket.gethostname() or "unknown",
+    }
+
+
+def sign_body(message_id: str, body: Any, serial: str) -> str:
+    """Match apps/service Message.sign / makeSerialKeySignature."""
+    h = hashlib.sha256()
+    h.update(message_id.encode("utf-8"))
+    h.update(json.dumps(body, separators=(",", ":")).encode("utf-8"))
+    h.update(serial.encode("utf-8"))
+    return base64.b64encode(h.digest()).decode("ascii")
+
+
+def system_string() -> str:
+    try:
+        return platform.version() or f"Linux {platform.release()}"
+    except Exception:
+        return f"Linux {platform.release()}"
+
+
+def build_sync_message(
+    *,
+    msg_type: str,
+    body: Any,
+    computer_id: str,
+    serial: str,
+    db_version: int,
+    receivers: list[str] | None = None,
+) -> str:
+    msg_id = str(uuid.uuid4())
+    # Signature covers id + JSON body + serial (body must be set before signing)
+    signature = sign_body(msg_id, body, serial)
+    envelope = {
+        "header": {
+            "id": msg_id,
+            "type": msg_type,
+            "signature": signature,
+            "dbversion": db_version,
+            "computerID": computer_id,
+            "receivers": receivers or [],
+        },
+        "body": body,
+    }
+    return json.dumps(envelope, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# Minimal WebSocket (server side)
+# ---------------------------------------------------------------------------
+
+def ws_accept_key(sec_key: str) -> str:
+    digest = hashlib.sha1((sec_key + WS_GUID).encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def ws_send_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
+    """Send an unmasked server→client frame."""
+    length = len(payload)
+    header = bytearray()
+    header.append(0x80 | (opcode & 0x0F))
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", length))
+    sock.sendall(header + payload)
+
+
+def ws_send_text(sock: socket.socket, text: str) -> None:
+    ws_send_frame(sock, 0x1, text.encode("utf-8"))
+
+
+def ws_send_pong(sock: socket.socket, payload: bytes) -> None:
+    ws_send_frame(sock, 0xA, payload)
+
+
+def ws_send_close(sock: socket.socket, code: int = 1000) -> None:
+    ws_send_frame(sock, 0x8, struct.pack("!H", code))
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def ws_recv_frame(sock: socket.socket) -> tuple[int, bytes]:
+    """Receive one client→server (masked) frame. Returns (opcode, payload)."""
+    hdr = _recv_exact(sock, 2)
+    opcode = hdr[0] & 0x0F
+    masked = (hdr[1] & 0x80) != 0
+    length = hdr[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    mask = _recv_exact(sock, 4) if masked else b""
+    payload = _recv_exact(sock, length) if length else b""
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+# ---------------------------------------------------------------------------
+# HTTP + WebSocket handler
+# ---------------------------------------------------------------------------
+
+class PresenceHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    identity: dict[str, Any] = {}
+
+    def log_message(self, fmt: str, *args) -> None:
+        if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
+            super().log_message(fmt, *args)
+
+    def do_GET(self) -> None:  # noqa: N802
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        connection = (self.headers.get("Connection") or "").lower()
+        if upgrade == "websocket" and "upgrade" in connection:
+            self._handle_websocket()
+            return
+
+        path = self.path.split("?", 1)[0]
+        if path == "/ping":
+            self._handle_ping()
+            return
+
+        self.send_error(404, "Not Found")
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if self.path.split("?", 1)[0] != "/ping":
+            self.send_error(404, "Not Found")
+            return
+        body = self._ping_body()
+        message_id = str(uuid.uuid4())
+        signature = sign_body(message_id, body, self.identity["serial"])
+        self.send_response(200)
+        self._ping_headers(message_id, signature)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _ping_body(self) -> dict[str, str]:
+        return {
+            "synergy_version": VERSION,
+            "hostname": self.identity["hostname"],
+            "system": system_string(),
+        }
+
+    def _ping_headers(self, message_id: str, signature: str) -> None:
+        self.send_header("X-Powered-By", "Express")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Synergy-Message-ID", message_id)
+        self.send_header("X-Synergy-Computer-ID", self.identity["computer_id"])
+        self.send_header("X-Synergy-Signature", signature)
+        self.send_header("X-Synergy-DB-Version", str(self.identity["schema"]))
+
+    def _handle_ping(self) -> None:
+        body = self._ping_body()
+        message_id = str(uuid.uuid4())
+        signature = sign_body(message_id, body, self.identity["serial"])
+        payload = json.dumps({"data": body}, separators=(",", ":")).encode("utf-8")
+        self.send_response(200)
+        self._ping_headers(message_id, signature)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _handle_websocket(self) -> None:
+        sec_key = self.headers.get("Sec-WebSocket-Key")
+        if not sec_key:
+            self.send_error(400, "Missing Sec-WebSocket-Key")
+            return
+
+        accept = ws_accept_key(sec_key.strip())
+        # RFC6455 handshake
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        sock = self.connection
+        peer = self.client_address[0]
+        if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
+            print(f"synergy-presence: ws open from {peer}", flush=True)
+
+        # Mirror real service onConnected: dbcheck + addpeer
+        try:
+            self._ws_send_hello(sock)
+            self._ws_loop(sock, peer)
+        except (ConnectionError, BrokenPipeError, OSError) as exc:
+            if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
+                print(f"synergy-presence: ws closed {peer}: {exc}", flush=True)
+        finally:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+            # Prevent BaseHTTPRequestHandler from double-closing
+            self.close_connection = True
+
+    def _ws_send_hello(self, sock: socket.socket) -> None:
+        ident = self.identity
+        db_body = {
+            "syncVersion": ident["sync_version"],
+            "schemaVersion": ident["schema"],
+        }
+        addpeer_body = {
+            "id": ident["computer_id"],
+            "ips": ident["ips"],
+        }
+        ws_send_text(
+            sock,
+            build_sync_message(
+                msg_type="dbcheck",
+                body=db_body,
+                computer_id=ident["computer_id"],
+                serial=ident["serial"],
+                db_version=ident["schema"],
+            ),
+        )
+        ws_send_text(
+            sock,
+            build_sync_message(
+                msg_type="addpeer",
+                body=addpeer_body,
+                computer_id=ident["computer_id"],
+                serial=ident["serial"],
+                db_version=ident["schema"],
+            ),
+        )
+
+    def _ws_loop(self, sock: socket.socket, peer: str) -> None:
+        sock.settimeout(120.0)
+        while True:
+            try:
+                opcode, payload = ws_recv_frame(sock)
+            except socket.timeout:
+                # Quiet period; keep listening
+                continue
+
+            if opcode == 0x8:  # close
+                try:
+                    ws_send_close(sock)
+                except OSError:
+                    pass
+                return
+            if opcode == 0x9:  # ping → pong
+                ws_send_pong(sock, payload)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode != 0x1:  # ignore binary/continuation
+                continue
+
+            text = payload.decode("utf-8", errors="replace")
+            self._ws_on_message(sock, peer, text)
+
+    def _ws_on_message(self, sock: socket.socket, peer: str, text: str) -> None:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        header = data.get("header") or {}
+        body = data.get("body")
+        msg_type = header.get("type") or ""
+        if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
+            print(f"synergy-presence: msg {msg_type} from {peer}", flush=True)
+
+        ident = self.identity
+        # Optional signature check (same license = both machines share serial)
+        msg_id = header.get("id") or ""
+        their_sig = header.get("signature") or ""
+        if msg_id and their_sig and body is not None:
+            expect = sign_body(msg_id, body, ident["serial"])
+            if expect != their_sig:
+                if os.environ.get("SYNERGY_PRESENCE_DEBUG"):
+                    print("synergy-presence: bad signature, ignoring", flush=True)
+                return
+
+        if msg_type == "dbcheck":
+            # Reply with our version so peer can decide; we never push full DB.
+            db_body = {
+                "syncVersion": ident["sync_version"],
+                "schemaVersion": ident["schema"],
+            }
+            ws_send_text(
+                sock,
+                build_sync_message(
+                    msg_type="dbcheck",
+                    body=db_body,
+                    computer_id=ident["computer_id"],
+                    serial=ident["serial"],
+                    db_version=ident["schema"],
+                ),
+            )
+        elif msg_type == "addpeer":
+            # Acknowledge with our identity
+            addpeer_body = {
+                "id": ident["computer_id"],
+                "ips": ident["ips"],
+            }
+            ws_send_text(
+                sock,
+                build_sync_message(
+                    msg_type="addpeer",
+                    body=addpeer_body,
+                    computer_id=ident["computer_id"],
+                    serial=ident["serial"],
+                    db_version=ident["schema"],
+                ),
+            )
+        elif msg_type in ("senddb", "ipbroadcast", "reset", "updateSerial"):
+            # Presence-only: do not apply remote DB / reset / serial updates.
+            pass
+
+
+def main() -> int:
+    identity = load_identity()
+    port = int(os.environ.get("SYNERGY_PING_PORT", DEFAULT_PORT))
+    host = os.environ.get("SYNERGY_PRESENCE_BIND", "0.0.0.0")
+
+    PresenceHandler.identity = identity
+
+    httpd = ThreadingHTTPServer((host, port), PresenceHandler)
+    httpd.allow_reuse_address = True
+    # Daemon threads so stop is clean
+    httpd.daemon_threads = True
+
+    print(
+        f"synergy-presence: /ping+ws on {host}:{port} "
+        f"id={identity['computer_id'][:12]}… "
+        f"schema={identity['schema']} sync={identity['sync_version']} "
+        f"host={identity['hostname']} ips={identity['ips']}",
+        flush=True,
+    )
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("synergy-presence: stopped", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

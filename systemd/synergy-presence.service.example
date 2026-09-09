@@ -1,0 +1,17 @@
+[Unit]
+Description=Synergy 3 mesh presence shim (/ping + WebSocket on 24802)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the PATH for your distribution. The shim itself needs only python3
+# from PATH. (On NixOS, add your system binary path here as well.)
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/synergy-presence
+Restart=always
+RestartSec=2
+# Quiet by default; set SYNERGY_PRESENCE_DEBUG=1 for per-message logging.
+
+[Install]
+WantedBy=default.target
