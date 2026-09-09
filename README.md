@@ -125,6 +125,25 @@ intentionally unsupported (remote DB content is never applied locally), so a
 peer pushing bulk state it believes is unacknowledged is a residual,
 separately-investigated behaviour. See `docs/livelock-investigation.md`.
 
+## What this shim does not fix
+
+This project only provides the Linux/NixOS/Hyprland **24802 mesh
+presence/sync compatibility layer**. It does not supervise or repair the
+macOS Synergy input server on TCP **24800**, and it does not replace
+`waynergy`.
+
+During investigation of Synergy 3.6.3 on macOS, a separate process-lifecycle
+failure was observed: `synergy-service` could terminate while a child
+`synergy-core` survived as an orphan, continued to hold TCP 24800, but stopped
+servicing accepts. A new core could then fail with `Address already in use`,
+leaving the Synergy UI apparently ready while the actual input listener was
+unusable.
+
+That is a **Synergy/macOS process-supervision problem**, not a 24802 shim
+problem. A small local macOS watchdog can independently probe 127.0.0.1:24800
+and recover only a confirmed orphaned core; such a watchdog intentionally does
+not belong in this repository because it is outside this project's scope.
+
 ## Networking
 
 At home, this host and its peers communicate over the local LAN using
