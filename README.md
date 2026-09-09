@@ -62,17 +62,19 @@ expected structure with placeholder values.
 - `GET /ping` with a signed body (`synergy_version`, hostname, system string).
 - RFC 6455 WebSocket upgrade on `/`.
 - One `dbcheck` + one `addpeer` hello per new connection.
-- A 1:1 reply to each inbound `dbcheck`/`addpeer` using the locally stored
-  versions. See `docs/protocol-notes.md`.
+- A state-driven reply to inbound `dbcheck`/`addpeer`: each distinct version
+  situation is answered once per connection, then the shim stays silent.
+  See `docs/protocol-notes.md`.
 
 ## Known limitations
 
-- It does **not** implement full database convergence: versions are read once
-  at startup and never advance; inbound versions are never compared.
+- It does **not** implement full database convergence: advertised versions
+  track the local `db.json` (re-read when it changes) and inbound versions are
+  compared so repeats go unanswered, but remote DB content is never applied.
 - `senddb`, `ipbroadcast`, `reset`, and `updateSerial` are ignored entirely:
   remote DB content is never applied locally.
-- Every reply mints a fresh message ID. Replies are cryptographically valid
-  but semantically identical, repeated indefinitely.
+- Replies still mint a fresh message ID each; they are cryptographically valid
+  but at most one per distinct state per connection.
 - One thread per connection; idle connections are never reaped by the shim.
 - Under investigation: a sync-message livelock with real Synergy 3.6.3 peers
   at high message rates. See `docs/livelock-investigation.md`. This project is
