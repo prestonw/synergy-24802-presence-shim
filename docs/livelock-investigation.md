@@ -67,3 +67,28 @@
 - That the defect is in Synergy rather than in this shim.
 - That fresh IDs alone, or static versions alone, cause the loop.
 - Any statement about peer-side internals beyond observed resource symptoms.
+
+## Update: convergence fix deployed (branch `fix/convergent-sync`, PR #1)
+
+The minimal fix was implemented and deployed to production after review:
+
+- `dbcheck`: reply at most once per distinct (peer-version, our-version)
+  pair per connection; repeats suppressed; unparseable bodies fail open once.
+- `addpeer`: each distinct announcement acknowledged at most once per
+  connection.
+- Advertised versions track `db.json` via mtime-guarded reload (no polling;
+  last-known-good kept on read/parse failure).
+- Signature verification, framing, `/ping`, hello, env vars unchanged;
+  `senddb` family still ignored by design.
+
+Measured production impact (kernel TCP counters, 60 s windows):
+
+- Before: ~2.83 MB/s inbound (2,304 seg/s), ~262 KB/s outbound (224/s),
+  shim at ~76% of one core; unrelated persistent 24800 input connection at
+  ~203 ms effective RTT vs ~11 ms floor.
+- Shim stopped: 24802 traffic zero; 24800 RTT back to ~12 ms; reporter
+  observed substantially improved pointer responsiveness. 24800/waynergy
+  never dropped (same TCP session throughout).
+- After deploying the fix: listener back, shim idle at 0% CPU awaiting the
+  peer's next natural reconnect; convergence proof pending that reconnect
+  (tracked by passive counter sampling, no payload capture).
